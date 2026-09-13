@@ -102,8 +102,15 @@ done.
 channel widths and dtypes; `test_varlen.py` covers packed sequences including
 single-pulse and ragged-boundary events.
 
-## Origin
+## Origin and downstream use
 
-Extracted from a graphnet branch (`transformers-flash`), where it is reached
-as `DeepIce(rel_attention="flash")`. Integration tests that need the model
-stay there.
+Developed inside [sevmag/graphnet](https://github.com/sevmag/graphnet) on the
+[`transformers-flash`](https://github.com/sevmag/graphnet/tree/transformers-flash)
+branch, where it is reached as `DeepIce(rel_attention="flash")` through
+`Block_rel.forward_flash`. That branch still carries its own copy of these
+files; this repository is the canonical one going forward.
+
+Integration tests that need the model -- `test_flash_spacetime.py` and
+`test_flash_spacetime_integration.py` -- stay in graphnet, since they import
+`DeepIce`, `Attention_rel` and `SpacetimeEncoder`. The two suites here are
+the ones that depend on nothing but this package.
