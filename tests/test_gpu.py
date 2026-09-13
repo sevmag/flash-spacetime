@@ -11,11 +11,8 @@ the eager path itself is (the reference IS the eager path, proven in stage
 (a)). Padding rows are asserted exactly zero (kernel contract; eager leaves
 garbage there that nothing downstream reads).
 
-The kernel currently supports C = D = 48 (the production head size) with
-three unrolled 16-channel chunks; the C-width generalisation lands with the
-autotune pass. Backward routes through the reference fallback until the
-dedicated Triton backward replaces it — these tests pin the public op's
-gradients either way.
+The shapes cover all three supported channel widths (16, 32, 48), which
+exercise one, two and three 16-wide channel chunks respectively.
 """
 
 from typing import Dict, Optional, Tuple
@@ -61,7 +58,8 @@ def _atol(dtype: torch.dtype, flags: Tuple[bool, bool]) -> float:
 
 
 # (batch, length, heads, head_dim): straddles BLOCK_M=16 / BLOCK_N=32
-# boundaries on both sides, plus the production shape.
+# boundaries on both sides, plus the production shape and the narrower
+# channel widths (one and two chunks instead of three).
 SHAPES = [
     (2, 1, 4, 48),
     (2, 3, 4, 48),
@@ -74,6 +72,8 @@ SHAPES = [
     (2, 128, 4, 48),
     (2, 200, 16, 48),
     (1, 800, 16, 48),
+    (2, 33, 4, 16),
+    (2, 33, 4, 32),
 ]
 FLAGS = [(True, True), (True, False), (False, True), (False, False)]
 
@@ -234,7 +234,9 @@ def test_forward_deterministic(
     assert torch.equal(lse1, lse2)
 
 
-@pytest.mark.parametrize("shape", [SHAPES[2], SHAPES[5], SHAPES[9]])
+@pytest.mark.parametrize(
+    "shape", [SHAPES[2], SHAPES[5], SHAPES[9], SHAPES[11], SHAPES[12]]
+)
 @pytest.mark.parametrize("flags", FLAGS)
 @pytest.mark.parametrize("masked", [False, True])
 def test_backward_matches_oracle(
