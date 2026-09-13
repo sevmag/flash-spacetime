@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "flash-spacetime"
+version = "0.1.0"
+description = "Fused attention with a learned spacetime-interval bias on query-key pairs"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = ["torch>=2.4"]
+
+[project.optional-dependencies]
+# Triton is not declared as a hard dependency: the reference implementation and
+# the band constants are useful on a CPU-only machine, and the kernels are
+# imported lazily. Install this extra to run them.
+cuda = ["triton>=3.0"]
+dev = ["pytest>=7"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
