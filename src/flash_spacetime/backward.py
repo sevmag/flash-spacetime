@@ -1,7 +1,7 @@
 """Triton backward kernels for fused spacetime-bias attention.
 
-Deterministic two-kernel scheme (DESIGN.md §8) with the projection folded
-to the host on both sides, mirroring the forward:
+Deterministic two-kernel scheme with the projection folded to the host on
+both sides, mirroring the forward:
 
 - host prologue: `u = (q·scale) @ W`, `w~ = dO @ W`, `dOβ = dO·β` (all
   deterministic GEMMs/reductions);
@@ -45,39 +45,90 @@ from flash_spacetime.reference import (
     TIME_SCALE,
     sinusoidal_frequencies,
 )
-from flash_spacetime.forward import (
-    _e_chunk,
+from flash_spacetime._tiles import (
+    _acc3_dotT,
+    _acc3_e,
+    _chunk_off,
+    _coords4,
+    _dot3_e,
+    _dot3_qk,
+    _e_chunks3,
+    _feat_ptrs,
+    _load3,
+    _load3_scaled,
     _next_pow2,
     _pair_angle,
+    _store3,
+    _vec_off,
+    _zeros3,
 )
 
 
 @triton.jit
+def _bwd_row_operands(
+    q_ptr, do_ptr, u_ptr, wt_ptr, lse_ptr, dob_ptr, feats_ptr,
+    b, tok0, offs_m, offs_g, offs_cc, seqlen, scale,
+    H: tl.constexpr,
+    L: tl.constexpr,
+    FEAT_STRIDE: tl.constexpr,
+    C_: tl.constexpr,
+    C_CHUNK: tl.constexpr,
+    USE_ATTN_BIAS: tl.constexpr,
+    USE_ACT_BIAS: tl.constexpr,
+    PACKED: tl.constexpr,
+    CDTYPE: tl.constexpr,
+) -> tuple:
+    """Everything both backward kernels need for one block of query rows:
+
+    offsets and masks, the qt/dO/u/w~ chunk triples (u and w~ falling back
+    to qt aliases when their bias term is off — never read then), the
+    saved LSE and dO·β, and the rows' interval coordinates. Padding rows
+    and dead heads load 0.
+    """
+    row_valid = offs_m < seqlen
+    head_live = offs_g < H
+    row_off = _chunk_off(b, tok0, offs_m, offs_g, offs_cc, H, L, C_, PACKED)
+    row_mask = row_valid[:, None, None] & head_live[None, :, None]
+    qt0, qt1, qt2 = _load3_scaled(
+        q_ptr, row_off, row_mask, scale, C_, C_CHUNK, CDTYPE
+    )
+    do0, do1, do2 = _load3(do_ptr, row_off, row_mask, C_, C_CHUNK, CDTYPE)
+    if USE_ATTN_BIAS:
+        u0, u1, u2 = _load3(u_ptr, row_off, row_mask, C_, C_CHUNK, CDTYPE)
+    else:
+        u0, u1, u2 = qt0, qt1, qt2
+    if USE_ACT_BIAS:
+        wt0, wt1, wt2 = _load3(wt_ptr, row_off, row_mask, C_, C_CHUNK, CDTYPE)
+    else:
+        wt0, wt1, wt2 = qt0, qt1, qt2
+    row_vec = _vec_off(b, tok0, offs_m, offs_g, H, L, PACKED)
+    row_vec_mask = row_valid[:, None] & head_live[None, :]
+    lse = tl.load(lse_ptr + row_vec, mask=row_vec_mask, other=0.0)
+    if USE_ACT_BIAS:
+        dob = tl.load(dob_ptr + row_vec, mask=row_vec_mask, other=0.0)
+    else:
+        dob = lse * 0.0
+    feats_i = _feat_ptrs(feats_ptr, b, tok0, offs_m, FEAT_STRIDE, L, PACKED)
+    pix, piy, piz, pit = _coords4(feats_i, row_valid)
+    return (
+        row_off, row_mask, row_vec, row_vec_mask,
+        qt0, qt1, qt2, do0, do1, do2, u0, u1, u2, wt0, wt1, wt2,
+        lse, dob, pix, piy, piz, pit,
+    )
+
+
+@triton.jit
 def _recompute_p_dpr(
-    qt0: tl.tensor,
-    qt1: tl.tensor,
-    qt2: tl.tensor,  # [M, G, CC]
-    u0: tl.tensor,
-    u1: tl.tensor,
-    u2: tl.tensor,
-    do0: tl.tensor,
-    do1: tl.tensor,
-    do2: tl.tensor,
-    k0: tl.tensor,
-    k1: tl.tensor,
-    k2: tl.tensor,  # [N, G, CC]
-    v0: tl.tensor,
-    v1: tl.tensor,
-    v2: tl.tensor,
-    e0: tl.tensor,
-    e1: tl.tensor,
-    e2: tl.tensor,  # [M, N, CC]
-    wt0: tl.tensor,
-    wt1: tl.tensor,
-    wt2: tl.tensor,  # w~ chunks [M, G, CC]
-    dob: tl.tensor,  # [M, G] dO·β
-    lse: tl.tensor,  # [M, G]
-    col_valid: tl.tensor,  # [N]
+    qt0, qt1, qt2,  # [M, G, CC]
+    u0, u1, u2,
+    do0, do1, do2,
+    k0, k1, k2,  # [N, G, CC]
+    v0, v1, v2,
+    e0, e1, e2,  # [M, CC, N]
+    wt0, wt1, wt2,  # w~ chunks [M, G, CC]
+    dob,  # [M, G] dO·β
+    lse,  # [M, G]
+    col_valid,  # [N]
     C_: tl.constexpr,
     C_CHUNK: tl.constexpr,
     USE_ATTN_BIAS: tl.constexpr,
@@ -93,30 +144,12 @@ def _recompute_p_dpr(
     frontend parses the return annotation of a jit'd function and
     rejects `typing` constructs.
     """
-    s = tl.dot(
-        tl.trans(qt0, 1, 0, 2),
-        tl.trans(k0, 1, 2, 0),
-        input_precision=INPUT_PRECISION,
-    )
-    if C_ > C_CHUNK:
-        s += tl.dot(
-            tl.trans(qt1, 1, 0, 2),
-            tl.trans(k1, 1, 2, 0),
-            input_precision=INPUT_PRECISION,
-        )
-    if C_ > 2 * C_CHUNK:
-        s += tl.dot(
-            tl.trans(qt2, 1, 0, 2),
-            tl.trans(k2, 1, 2, 0),
-            input_precision=INPUT_PRECISION,
-        )  # [G, M, N]
+    s = _dot3_qk(qt0, qt1, qt2, k0, k1, k2, C_, C_CHUNK, INPUT_PRECISION)
     if USE_ATTN_BIAS:
-        sb = tl.dot(u0, e0, input_precision=INPUT_PRECISION)
-        if C_ > C_CHUNK:
-            sb += tl.dot(u1, e1, input_precision=INPUT_PRECISION)
-        if C_ > 2 * C_CHUNK:
-            sb += tl.dot(u2, e2, input_precision=INPUT_PRECISION)
-        s += tl.trans(sb, 1, 0, 2)
+        s += tl.trans(
+            _dot3_e(u0, u1, u2, e0, e1, e2, C_, C_CHUNK, INPUT_PRECISION),
+            1, 0, 2,
+        )
     s = tl.trans(s, 1, 0, 2)  # [M, G, N]
 
     # P from the saved LSE; exact zeros at masked columns.
@@ -124,47 +157,26 @@ def _recompute_p_dpr(
     p = tl.where(col_valid[None, None, :], p, 0.0)
 
     # dPraw = dO·v^T (+ [V] (w~·E + dO·β)).
-    dpr_acc = tl.dot(
-        tl.trans(do0, 1, 0, 2),
-        tl.trans(v0, 1, 2, 0),
-        input_precision=INPUT_PRECISION,
-    )
-    if C_ > C_CHUNK:
-        dpr_acc += tl.dot(
-            tl.trans(do1, 1, 0, 2),
-            tl.trans(v1, 1, 2, 0),
-            input_precision=INPUT_PRECISION,
-        )
-    if C_ > 2 * C_CHUNK:
-        dpr_acc += tl.dot(
-            tl.trans(do2, 1, 0, 2),
-            tl.trans(v2, 1, 2, 0),
-            input_precision=INPUT_PRECISION,
-        )
-    dpr = tl.trans(dpr_acc, 1, 0, 2)  # [M, G, N]
+    dpr = tl.trans(
+        _dot3_qk(do0, do1, do2, v0, v1, v2, C_, C_CHUNK, INPUT_PRECISION),
+        1, 0, 2,
+    )  # [M, G, N]
     if USE_ACT_BIAS:
-        wb = tl.dot(wt0, e0, input_precision=INPUT_PRECISION)
-        if C_ > C_CHUNK:
-            wb += tl.dot(wt1, e1, input_precision=INPUT_PRECISION)
-        if C_ > 2 * C_CHUNK:
-            wb += tl.dot(wt2, e2, input_precision=INPUT_PRECISION)
-        dpr += wb + dob[:, :, None]
+        dpr += (
+            _dot3_e(wt0, wt1, wt2, e0, e1, e2, C_, C_CHUNK, INPUT_PRECISION)
+            + dob[:, :, None]
+        )
     return p, dpr
 
 
 @triton.jit
 def _col_tiles(
-    k_ptr: tl.tensor,
-    v_ptr: tl.tensor,
-    freq_ptr: tl.tensor,
-    col_off: tl.tensor,  # [N, G, CC] element offsets of the key block
-    col_mask: tl.tensor,  # [N, G, 1]
-    feats_j: tl.tensor,  # [N] feature-row pointers of the key block
-    col_valid: tl.tensor,  # [N]
-    pix: tl.tensor,
-    piy: tl.tensor,
-    piz: tl.tensor,
-    pit: tl.tensor,  # [M] query positions
+    k_ptr, v_ptr, freq_ptr,
+    col_off,  # [N, G, CC] element offsets of the key block
+    col_mask,  # [N, G, 1]
+    feats_j,  # [N] feature-row pointers of the key block
+    col_valid,  # [N]
+    pix, piy, piz, pit,  # [M] query positions
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     C_: tl.constexpr,
@@ -178,63 +190,15 @@ def _col_tiles(
     CLIP: tl.constexpr,
 ) -> tuple:
     """K, v and pair-feature chunks of one key block for a row block."""
-    k0 = tl.load(k_ptr + col_off + 0 * C_CHUNK, mask=col_mask, other=0.0).to(
-        CDTYPE
-    )
-    if C_ > C_CHUNK:
-        k1 = tl.load(
-            k_ptr + col_off + 1 * C_CHUNK, mask=col_mask, other=0.0
-        ).to(CDTYPE)
-    else:
-        k1 = k0
-    if C_ > 2 * C_CHUNK:
-        k2 = tl.load(
-            k_ptr + col_off + 2 * C_CHUNK, mask=col_mask, other=0.0
-        ).to(CDTYPE)
-    else:
-        k2 = k0
-    v0 = tl.load(v_ptr + col_off + 0 * C_CHUNK, mask=col_mask, other=0.0).to(
-        CDTYPE
-    )
-    if C_ > C_CHUNK:
-        v1 = tl.load(
-            v_ptr + col_off + 1 * C_CHUNK, mask=col_mask, other=0.0
-        ).to(CDTYPE)
-    else:
-        v1 = v0
-    if C_ > 2 * C_CHUNK:
-        v2 = tl.load(
-            v_ptr + col_off + 2 * C_CHUNK, mask=col_mask, other=0.0
-        ).to(CDTYPE)
-    else:
-        v2 = v0
+    k0, k1, k2 = _load3(k_ptr, col_off, col_mask, C_, C_CHUNK, CDTYPE)
+    v0, v1, v2 = _load3(v_ptr, col_off, col_mask, C_, C_CHUNK, CDTYPE)
     if USE_ATTN_BIAS or USE_ACT_BIAS:
-        pjx = tl.load(feats_j + 0, mask=col_valid, other=0.0)
-        pjy = tl.load(feats_j + 1, mask=col_valid, other=0.0)
-        pjz = tl.load(feats_j + 2, mask=col_valid, other=0.0)
-        pjt = tl.load(feats_j + 3, mask=col_valid, other=0.0)
+        pjx, pjy, pjz, pjt = _coords4(feats_j, col_valid)
         x = _pair_angle(
-            pix,
-            piy,
-            piz,
-            pit,
-            pjx,
-            pjy,
-            pjz,
-            pjt,
-            TIME_SCALE_C,
-            INPUT_SCALE,
-            CLIP,
+            pix, piy, piz, pit, pjx, pjy, pjz, pjt,
+            TIME_SCALE_C, INPUT_SCALE, CLIP,
         )
-        e0 = _e_chunk(x, freq_ptr, 0 * C_CHUNK, F_, C_CHUNK, CDTYPE)
-        if C_ > C_CHUNK:
-            e1 = _e_chunk(x, freq_ptr, 1 * C_CHUNK, F_, C_CHUNK, CDTYPE)
-        else:
-            e1 = e0
-        if C_ > 2 * C_CHUNK:
-            e2 = _e_chunk(x, freq_ptr, 2 * C_CHUNK, F_, C_CHUNK, CDTYPE)
-        else:
-            e2 = e0
+        e0, e1, e2 = _e_chunks3(x, freq_ptr, C_, C_CHUNK, F_, CDTYPE)
     else:
         e0 = tl.zeros((BLOCK_M, C_CHUNK, BLOCK_N), dtype=CDTYPE)
         e1 = e0
@@ -243,26 +207,14 @@ def _col_tiles(
 
 
 @triton.jit
-def flash_spacetime_bwd_cols_kernel(  # noqa: C901
-    # The cyclomatic count is compile-time constexpr specialization
-    # (channel-chunk and bias-flag branches Triton resolves before
-    # codegen), not runtime control flow.
-    q_ptr: tl.tensor,
-    k_ptr: tl.tensor,
-    v_ptr: tl.tensor,
-    u_ptr: tl.tensor,
-    do_ptr: tl.tensor,
-    wt_ptr: tl.tensor,
-    feats_ptr: tl.tensor,
-    seqlen_ptr: tl.tensor,
-    lse_ptr: tl.tensor,
-    d_ptr: tl.tensor,  # [B, H, L] softmax row sums from the row kernel
-    dob_ptr: tl.tensor,
-    dk_ptr: tl.tensor,
-    dv_ptr: tl.tensor,
-    cu_ptr: tl.tensor,  # [B+1] token offsets (PACKED only)
-    freq_ptr: tl.tensor,
-    scale: float,
+def flash_spacetime_bwd_cols_kernel(
+    q_ptr, k_ptr, v_ptr, u_ptr, do_ptr, wt_ptr,
+    feats_ptr, seqlen_ptr, lse_ptr,
+    d_ptr,  # [B, H, L] softmax row sums from the row kernel
+    dob_ptr, dk_ptr, dv_ptr,
+    cu_ptr,  # [B+1] token offsets (PACKED only)
+    freq_ptr,
+    scale,
     L: tl.constexpr,
     H: tl.constexpr,
     FEAT_STRIDE: tl.constexpr,
@@ -299,259 +251,46 @@ def flash_spacetime_bwd_cols_kernel(  # noqa: C901
     col_valid = offs_n < seqlen
     head_live = offs_g < H
 
-    if PACKED:
-        col_off = (
-            (tok0 + offs_n[:, None, None]) * H + offs_g[None, :, None]
-        ) * C_ + offs_cc[None, None, :]
-    else:
-        col_off = (
-            (b * H + offs_g[None, :, None]) * L + offs_n[:, None, None]
-        ) * C_ + offs_cc[None, None, :]
+    col_off = _chunk_off(b, tok0, offs_n, offs_g, offs_cc, H, L, C_, PACKED)
     col_mask = col_valid[:, None, None] & head_live[None, :, None]
-    k0 = tl.load(k_ptr + col_off + 0 * C_CHUNK, mask=col_mask, other=0.0).to(
-        CDTYPE
-    )
-    if C_ > C_CHUNK:
-        k1 = tl.load(
-            k_ptr + col_off + 1 * C_CHUNK, mask=col_mask, other=0.0
-        ).to(CDTYPE)
-    else:
-        k1 = k0
-    if C_ > 2 * C_CHUNK:
-        k2 = tl.load(
-            k_ptr + col_off + 2 * C_CHUNK, mask=col_mask, other=0.0
-        ).to(CDTYPE)
-    else:
-        k2 = k0
-    v0 = tl.load(v_ptr + col_off + 0 * C_CHUNK, mask=col_mask, other=0.0).to(
-        CDTYPE
-    )
-    if C_ > C_CHUNK:
-        v1 = tl.load(
-            v_ptr + col_off + 1 * C_CHUNK, mask=col_mask, other=0.0
-        ).to(CDTYPE)
-    else:
-        v1 = v0
-    if C_ > 2 * C_CHUNK:
-        v2 = tl.load(
-            v_ptr + col_off + 2 * C_CHUNK, mask=col_mask, other=0.0
-        ).to(CDTYPE)
+    k0, k1, k2 = _load3(k_ptr, col_off, col_mask, C_, C_CHUNK, CDTYPE)
+    v0, v1, v2 = _load3(v_ptr, col_off, col_mask, C_, C_CHUNK, CDTYPE)
+    feats_j = _feat_ptrs(feats_ptr, b, tok0, offs_n, FEAT_STRIDE, L, PACKED)
+    pjx, pjy, pjz, pjt = _coords4(feats_j, col_valid)
 
-    else:
-        v2 = v0
-    if PACKED:
-        feats_j = feats_ptr + (tok0 + offs_n) * FEAT_STRIDE
-    else:
-        feats_j = feats_ptr + b * L * FEAT_STRIDE + offs_n * FEAT_STRIDE
-    pjx = tl.load(feats_j + 0, mask=col_valid, other=0.0)
-    pjy = tl.load(feats_j + 1, mask=col_valid, other=0.0)
-    pjz = tl.load(feats_j + 2, mask=col_valid, other=0.0)
-    pjt = tl.load(feats_j + 3, mask=col_valid, other=0.0)
-
-    dk0 = tl.zeros((BLOCK_N, G_PAD, C_CHUNK), dtype=tl.float32)
-    if C_ > C_CHUNK:
-        dk1 = tl.zeros((BLOCK_N, G_PAD, C_CHUNK), dtype=tl.float32)
-    if C_ > 2 * C_CHUNK:
-        dk2 = tl.zeros((BLOCK_N, G_PAD, C_CHUNK), dtype=tl.float32)
-    dv0 = tl.zeros((BLOCK_N, G_PAD, C_CHUNK), dtype=tl.float32)
-    if C_ > C_CHUNK:
-        dv1 = tl.zeros((BLOCK_N, G_PAD, C_CHUNK), dtype=tl.float32)
-    if C_ > 2 * C_CHUNK:
-        dv2 = tl.zeros((BLOCK_N, G_PAD, C_CHUNK), dtype=tl.float32)
+    dk0, dk1, dk2 = _zeros3(BLOCK_N, G_PAD, C_CHUNK)
+    dv0, dv1, dv2 = _zeros3(BLOCK_N, G_PAD, C_CHUNK)
 
     for m0 in range(0, L, BLOCK_M):
         offs_m = m0 + tl.arange(0, BLOCK_M)
-        row_valid = offs_m < seqlen
         if m0 < seqlen:
-            if PACKED:
-                row_off = (
-                    (tok0 + offs_m[:, None, None]) * H + offs_g[None, :, None]
-                ) * C_ + offs_cc[None, None, :]
-            else:
-                row_off = (
-                    (b * H + offs_g[None, :, None]) * L + offs_m[:, None, None]
-                ) * C_ + offs_cc[None, None, :]
-            row_mask = row_valid[:, None, None] & head_live[None, :, None]
-            qt0 = (
-                tl.load(
-                    q_ptr + row_off + 0 * C_CHUNK, mask=row_mask, other=0.0
-                )
-                * scale
-            ).to(CDTYPE)
-            if C_ > C_CHUNK:
-                qt1 = (
-                    tl.load(
-                        q_ptr + row_off + 1 * C_CHUNK, mask=row_mask, other=0.0
-                    )
-                    * scale
-                ).to(CDTYPE)
-            else:
-                qt1 = qt0
-            if C_ > 2 * C_CHUNK:
-                qt2 = (
-                    tl.load(
-                        q_ptr + row_off + 2 * C_CHUNK, mask=row_mask, other=0.0
-                    )
-                    * scale
-                ).to(CDTYPE)
-            else:
-                qt2 = qt0
-            do0 = tl.load(
-                do_ptr + row_off + 0 * C_CHUNK, mask=row_mask, other=0.0
-            ).to(CDTYPE)
-            if C_ > C_CHUNK:
-                do1 = tl.load(
-                    do_ptr + row_off + 1 * C_CHUNK, mask=row_mask, other=0.0
-                ).to(CDTYPE)
-            else:
-                do1 = do0
-            if C_ > 2 * C_CHUNK:
-                do2 = tl.load(
-                    do_ptr + row_off + 2 * C_CHUNK, mask=row_mask, other=0.0
-                ).to(CDTYPE)
-            else:
-                do2 = do0
-            if USE_ATTN_BIAS:
-                u0 = tl.load(
-                    u_ptr + row_off + 0 * C_CHUNK, mask=row_mask, other=0.0
-                ).to(CDTYPE)
-                if C_ > C_CHUNK:
-                    u1 = tl.load(
-                        u_ptr + row_off + 1 * C_CHUNK, mask=row_mask, other=0.0
-                    ).to(CDTYPE)
-                else:
-                    u1 = u0
-                if C_ > 2 * C_CHUNK:
-                    u2 = tl.load(
-                        u_ptr + row_off + 2 * C_CHUNK, mask=row_mask, other=0.0
-                    ).to(CDTYPE)
-                else:
-                    u2 = u0
-            else:
-                u0 = qt0
-                if C_ > C_CHUNK:
-                    u1 = qt1
-                else:
-                    u1 = u0
-                if C_ > 2 * C_CHUNK:
-                    u2 = qt2
-                else:
-                    u2 = u0
-            if USE_ACT_BIAS:
-                wt0 = tl.load(
-                    wt_ptr + row_off + 0 * C_CHUNK, mask=row_mask, other=0.0
-                ).to(CDTYPE)
-                if C_ > C_CHUNK:
-                    wt1 = tl.load(
-                        wt_ptr + row_off + 1 * C_CHUNK,
-                        mask=row_mask,
-                        other=0.0,
-                    ).to(CDTYPE)
-                else:
-                    wt1 = wt0
-                if C_ > 2 * C_CHUNK:
-                    wt2 = tl.load(
-                        wt_ptr + row_off + 2 * C_CHUNK,
-                        mask=row_mask,
-                        other=0.0,
-                    ).to(CDTYPE)
-                else:
-                    wt2 = wt0
-            else:
-                wt0 = qt0
-                if C_ > C_CHUNK:
-                    wt1 = qt1
-                else:
-                    wt1 = wt0
-                if C_ > 2 * C_CHUNK:
-                    wt2 = qt2
-
-                else:
-                    wt2 = wt0
-            if PACKED:
-                row_vec = (tok0 + offs_m[:, None]) * H + offs_g[None, :]
-            else:
-                row_vec = (b * H + offs_g[None, :]) * L + offs_m[:, None]
-            row_vec_mask = row_valid[:, None] & head_live[None, :]
-            lse = tl.load(lse_ptr + row_vec, mask=row_vec_mask, other=0.0)
+            (
+                row_off, row_mask, row_vec, row_vec_mask,
+                qt0, qt1, qt2, do0, do1, do2, u0, u1, u2, wt0, wt1, wt2,
+                lse, dob, pix, piy, piz, pit,
+            ) = _bwd_row_operands(
+                q_ptr, do_ptr, u_ptr, wt_ptr, lse_ptr, dob_ptr, feats_ptr,
+                b, tok0, offs_m, offs_g, offs_cc, seqlen, scale,
+                H, L, FEAT_STRIDE, C_, C_CHUNK,
+                USE_ATTN_BIAS, USE_ACT_BIAS, PACKED, CDTYPE,
+            )
             d_row = tl.load(d_ptr + row_vec, mask=row_vec_mask, other=0.0)
-            if USE_ACT_BIAS:
-                dob = tl.load(dob_ptr + row_vec, mask=row_vec_mask, other=0.0)
-            else:
-                dob = lse * 0.0
-
-            if PACKED:
-                feats_i = feats_ptr + (tok0 + offs_m) * FEAT_STRIDE
-            else:
-                feats_i = (
-                    feats_ptr + b * L * FEAT_STRIDE + offs_m * FEAT_STRIDE
-                )
-            pix = tl.load(feats_i + 0, mask=row_valid, other=0.0)
-            piy = tl.load(feats_i + 1, mask=row_valid, other=0.0)
-            piz = tl.load(feats_i + 2, mask=row_valid, other=0.0)
-            pit = tl.load(feats_i + 3, mask=row_valid, other=0.0)
 
             if USE_ATTN_BIAS or USE_ACT_BIAS:
                 x = _pair_angle(
-                    pix,
-                    piy,
-                    piz,
-                    pit,
-                    pjx,
-                    pjy,
-                    pjz,
-                    pjt,
-                    TIME_SCALE_C,
-                    INPUT_SCALE,
-                    CLIP,
+                    pix, piy, piz, pit, pjx, pjy, pjz, pjt,
+                    TIME_SCALE_C, INPUT_SCALE, CLIP,
                 )
-                e0 = _e_chunk(x, freq_ptr, 0 * C_CHUNK, F_, C_CHUNK, CDTYPE)
-                if C_ > C_CHUNK:
-                    e1 = _e_chunk(
-                        x, freq_ptr, 1 * C_CHUNK, F_, C_CHUNK, CDTYPE
-                    )
-                else:
-                    e1 = e0
-                if C_ > 2 * C_CHUNK:
-                    e2 = _e_chunk(
-                        x, freq_ptr, 2 * C_CHUNK, F_, C_CHUNK, CDTYPE
-                    )
-                else:
-                    e2 = e0
+                e0, e1, e2 = _e_chunks3(x, freq_ptr, C_, C_CHUNK, F_, CDTYPE)
             else:
                 e0 = tl.zeros((BLOCK_M, C_CHUNK, BLOCK_N), dtype=CDTYPE)
                 e1 = e0
                 e2 = e0
             p, dpr = _recompute_p_dpr(
-                qt0,
-                qt1,
-                qt2,
-                u0,
-                u1,
-                u2,
-                do0,
-                do1,
-                do2,
-                k0,
-                k1,
-                k2,
-                v0,
-                v1,
-                v2,
-                e0,
-                e1,
-                e2,
-                wt0,
-                wt1,
-                wt2,
-                dob,
-                lse,
-                col_valid,
-                C_,
-                C_CHUNK,
-                USE_ATTN_BIAS,
-                USE_ACT_BIAS,
-                INPUT_PRECISION,
+                qt0, qt1, qt2, u0, u1, u2, do0, do1, do2,
+                k0, k1, k2, v0, v1, v2, e0, e1, e2, wt0, wt1, wt2,
+                dob, lse, col_valid,
+                C_, C_CHUNK, USE_ATTN_BIAS, USE_ACT_BIAS, INPUT_PRECISION,
             )
             ds = p * (dpr - d_row[:, :, None])
             ds = tl.where(col_valid[None, None, :], ds, 0.0)
@@ -561,104 +300,28 @@ def flash_spacetime_bwd_cols_kernel(  # noqa: C901
             # dv_j += P^T dO_i ; dk_j += dS^T qt_i  (per chunk, [N, G, CC]).
             pT = tl.trans(pcd, 1, 2, 0)  # [G, N, M]
             dsT = tl.trans(dscd, 1, 2, 0)
-            dv0 += tl.trans(
-                tl.dot(
-                    pT, tl.trans(do0, 1, 0, 2), input_precision=INPUT_PRECISION
-                ),
-                1,
-                0,
-                2,
+            dv0, dv1, dv2 = _acc3_dotT(
+                dv0, dv1, dv2, pT, do0, do1, do2,
+                C_, C_CHUNK, INPUT_PRECISION,
             )
-            if C_ > C_CHUNK:
-                dv1 += tl.trans(
-                    tl.dot(
-                        pT,
-                        tl.trans(do1, 1, 0, 2),
-                        input_precision=INPUT_PRECISION,
-                    ),
-                    1,
-                    0,
-                    2,
-                )
-            if C_ > 2 * C_CHUNK:
-                dv2 += tl.trans(
-                    tl.dot(
-                        pT,
-                        tl.trans(do2, 1, 0, 2),
-                        input_precision=INPUT_PRECISION,
-                    ),
-                    1,
-                    0,
-                    2,
-                )
-            dk0 += tl.trans(
-                tl.dot(
-                    dsT,
-                    tl.trans(qt0, 1, 0, 2),
-                    input_precision=INPUT_PRECISION,
-                ),
-                1,
-                0,
-                2,
+            dk0, dk1, dk2 = _acc3_dotT(
+                dk0, dk1, dk2, dsT, qt0, qt1, qt2,
+                C_, C_CHUNK, INPUT_PRECISION,
             )
-            if C_ > C_CHUNK:
-                dk1 += tl.trans(
-                    tl.dot(
-                        dsT,
-                        tl.trans(qt1, 1, 0, 2),
-                        input_precision=INPUT_PRECISION,
-                    ),
-                    1,
-                    0,
-                    2,
-                )
-            if C_ > 2 * C_CHUNK:
-                dk2 += tl.trans(
-                    tl.dot(
-                        dsT,
-                        tl.trans(qt2, 1, 0, 2),
-                        input_precision=INPUT_PRECISION,
-                    ),
-                    1,
-                    0,
-                    2,
-                )
 
-    tl.store(dk_ptr + col_off + 0 * C_CHUNK, dk0, mask=col_mask)
-    if C_ > C_CHUNK:
-        tl.store(dk_ptr + col_off + 1 * C_CHUNK, dk1, mask=col_mask)
-    if C_ > 2 * C_CHUNK:
-        tl.store(dk_ptr + col_off + 2 * C_CHUNK, dk2, mask=col_mask)
-    tl.store(dv_ptr + col_off + 0 * C_CHUNK, dv0, mask=col_mask)
-    if C_ > C_CHUNK:
-        tl.store(dv_ptr + col_off + 1 * C_CHUNK, dv1, mask=col_mask)
-    if C_ > 2 * C_CHUNK:
-        tl.store(dv_ptr + col_off + 2 * C_CHUNK, dv2, mask=col_mask)
+    _store3(dk_ptr, col_off, dk0, dk1, dk2, col_mask, C_, C_CHUNK)
+    _store3(dv_ptr, col_off, dv0, dv1, dv2, col_mask, C_, C_CHUNK)
 
 
 @triton.jit
-def flash_spacetime_bwd_rows_kernel(  # noqa: C901
-    # The cyclomatic count is compile-time constexpr specialization
-    # (PACKED / bias-flag branches Triton resolves before codegen), not
-    # runtime control flow.
-    q_ptr: tl.tensor,
-    k_ptr: tl.tensor,
-    v_ptr: tl.tensor,
-    u_ptr: tl.tensor,
-    do_ptr: tl.tensor,
-    wt_ptr: tl.tensor,
-    feats_ptr: tl.tensor,
-    seqlen_ptr: tl.tensor,
-    lse_ptr: tl.tensor,
-    d_ptr: tl.tensor,  # [B, H, L] softmax row sums, written here
-    dob_ptr: tl.tensor,
-    dqp_ptr: tl.tensor,
-    hacc_ptr: tl.tensor,
-    gacc_ptr: tl.tensor,
-    sig_ptr: tl.tensor,
-    cu_ptr: tl.tensor,  # [B+1] token offsets (PACKED only)
-    freq_ptr: tl.tensor,
-    scale: float,
+def flash_spacetime_bwd_rows_kernel(
+    q_ptr, k_ptr, v_ptr, u_ptr, do_ptr, wt_ptr,
+    feats_ptr, seqlen_ptr, lse_ptr,
+    d_ptr,  # [B, H, L] softmax row sums, written here
+    dob_ptr, dqp_ptr, hacc_ptr, gacc_ptr, sig_ptr,
+    cu_ptr,  # [B+1] token offsets (PACKED only)
+    freq_ptr,
+    scale,
     L: tl.constexpr,
     H: tl.constexpr,
     FEAT_STRIDE: tl.constexpr,
@@ -692,123 +355,18 @@ def flash_spacetime_bwd_rows_kernel(  # noqa: C901
     offs_m = m0 + tl.arange(0, BLOCK_M)
     offs_g = tl.arange(0, G_PAD)
     offs_cc = tl.arange(0, C_CHUNK)
-    row_valid = offs_m < seqlen
     head_live = offs_g < H
 
-    if PACKED:
-        row_off = (
-            (tok0 + offs_m[:, None, None]) * H + offs_g[None, :, None]
-        ) * C_ + offs_cc[None, None, :]
-    else:
-        row_off = (
-            (b * H + offs_g[None, :, None]) * L + offs_m[:, None, None]
-        ) * C_ + offs_cc[None, None, :]
-    row_mask = row_valid[:, None, None] & head_live[None, :, None]
-    qt0 = (
-        tl.load(q_ptr + row_off + 0 * C_CHUNK, mask=row_mask, other=0.0)
-        * scale
-    ).to(CDTYPE)
-    if C_ > C_CHUNK:
-        qt1 = (
-            tl.load(q_ptr + row_off + 1 * C_CHUNK, mask=row_mask, other=0.0)
-            * scale
-        ).to(CDTYPE)
-    else:
-        qt1 = qt0
-    if C_ > 2 * C_CHUNK:
-        qt2 = (
-            tl.load(q_ptr + row_off + 2 * C_CHUNK, mask=row_mask, other=0.0)
-            * scale
-        ).to(CDTYPE)
-    else:
-        qt2 = qt0
-    do0 = tl.load(do_ptr + row_off + 0 * C_CHUNK, mask=row_mask, other=0.0).to(
-        CDTYPE
+    (
+        row_off, row_mask, row_vec, row_vec_mask,
+        qt0, qt1, qt2, do0, do1, do2, u0, u1, u2, wt0, wt1, wt2,
+        lse, dob, pix, piy, piz, pit,
+    ) = _bwd_row_operands(
+        q_ptr, do_ptr, u_ptr, wt_ptr, lse_ptr, dob_ptr, feats_ptr,
+        b, tok0, offs_m, offs_g, offs_cc, seqlen, scale,
+        H, L, FEAT_STRIDE, C_, C_CHUNK,
+        USE_ATTN_BIAS, USE_ACT_BIAS, PACKED, CDTYPE,
     )
-    if C_ > C_CHUNK:
-        do1 = tl.load(
-            do_ptr + row_off + 1 * C_CHUNK, mask=row_mask, other=0.0
-        ).to(CDTYPE)
-    else:
-        do1 = do0
-    if C_ > 2 * C_CHUNK:
-        do2 = tl.load(
-            do_ptr + row_off + 2 * C_CHUNK, mask=row_mask, other=0.0
-        ).to(CDTYPE)
-    else:
-        do2 = do0
-    if USE_ATTN_BIAS:
-        u0 = tl.load(
-            u_ptr + row_off + 0 * C_CHUNK, mask=row_mask, other=0.0
-        ).to(CDTYPE)
-        if C_ > C_CHUNK:
-            u1 = tl.load(
-                u_ptr + row_off + 1 * C_CHUNK, mask=row_mask, other=0.0
-            ).to(CDTYPE)
-        else:
-            u1 = u0
-        if C_ > 2 * C_CHUNK:
-            u2 = tl.load(
-                u_ptr + row_off + 2 * C_CHUNK, mask=row_mask, other=0.0
-            ).to(CDTYPE)
-        else:
-            u2 = u0
-    else:
-        u0 = qt0
-        if C_ > C_CHUNK:
-            u1 = qt1
-        else:
-            u1 = u0
-        if C_ > 2 * C_CHUNK:
-            u2 = qt2
-        else:
-            u2 = u0
-    if USE_ACT_BIAS:
-        wt0 = tl.load(
-            wt_ptr + row_off + 0 * C_CHUNK, mask=row_mask, other=0.0
-        ).to(CDTYPE)
-        if C_ > C_CHUNK:
-            wt1 = tl.load(
-                wt_ptr + row_off + 1 * C_CHUNK, mask=row_mask, other=0.0
-            ).to(CDTYPE)
-        else:
-            wt1 = wt0
-        if C_ > 2 * C_CHUNK:
-            wt2 = tl.load(
-                wt_ptr + row_off + 2 * C_CHUNK, mask=row_mask, other=0.0
-            ).to(CDTYPE)
-        else:
-            wt2 = wt0
-    else:
-        wt0 = qt0
-        if C_ > C_CHUNK:
-            wt1 = qt1
-        else:
-            wt1 = wt0
-        if C_ > 2 * C_CHUNK:
-            wt2 = qt2
-
-        else:
-            wt2 = wt0
-    if PACKED:
-        row_vec = (tok0 + offs_m[:, None]) * H + offs_g[None, :]
-    else:
-        row_vec = (b * H + offs_g[None, :]) * L + offs_m[:, None]
-    row_vec_mask = row_valid[:, None] & head_live[None, :]
-    lse = tl.load(lse_ptr + row_vec, mask=row_vec_mask, other=0.0)
-    if USE_ACT_BIAS:
-        dob = tl.load(dob_ptr + row_vec, mask=row_vec_mask, other=0.0)
-    else:
-        dob = lse * 0.0
-
-    if PACKED:
-        feats_i = feats_ptr + (tok0 + offs_m) * FEAT_STRIDE
-    else:
-        feats_i = feats_ptr + b * L * FEAT_STRIDE + offs_m * FEAT_STRIDE
-    pix = tl.load(feats_i + 0, mask=row_valid, other=0.0)
-    piy = tl.load(feats_i + 1, mask=row_valid, other=0.0)
-    piz = tl.load(feats_i + 2, mask=row_valid, other=0.0)
-    pit = tl.load(feats_i + 3, mask=row_valid, other=0.0)
 
     # First pass: the softmax row sum from the same P and dP that the second
     # pass turns into dS, so that rowsum(dS) is zero identically. It is the
@@ -823,169 +381,63 @@ def flash_spacetime_bwd_rows_kernel(  # noqa: C901
         offs_n = n0 + tl.arange(0, BLOCK_N)
         col_valid = offs_n < seqlen
         if n0 < seqlen:
-            if PACKED:
-                col_off = (
-                    (tok0 + offs_n[:, None, None]) * H + offs_g[None, :, None]
-                ) * C_ + offs_cc[None, None, :]
-                feats_j = feats_ptr + (tok0 + offs_n) * FEAT_STRIDE
-            else:
-                col_off = (
-                    (b * H + offs_g[None, :, None]) * L + offs_n[:, None, None]
-                ) * C_ + offs_cc[None, None, :]
-                feats_j = (
-                    feats_ptr + b * L * FEAT_STRIDE + offs_n * FEAT_STRIDE
-                )
+            col_off = _chunk_off(
+                b, tok0, offs_n, offs_g, offs_cc, H, L, C_, PACKED
+            )
+            feats_j = _feat_ptrs(
+                feats_ptr, b, tok0, offs_n, FEAT_STRIDE, L, PACKED
+            )
             col_mask = col_valid[:, None, None] & head_live[None, :, None]
             k0, k1, k2, v0, v1, v2, e0, e1, e2 = _col_tiles(
-                k_ptr,
-                v_ptr,
-                freq_ptr,
-                col_off,
-                col_mask,
-                feats_j,
-                col_valid,
-                pix,
-                piy,
-                piz,
-                pit,
-                BLOCK_M,
-                BLOCK_N,
-                C_,
-                C_CHUNK,
-                F_,
-                USE_ATTN_BIAS,
-                USE_ACT_BIAS,
-                CDTYPE,
-                TIME_SCALE_C,
-                INPUT_SCALE,
-                CLIP,
+                k_ptr, v_ptr, freq_ptr, col_off, col_mask, feats_j, col_valid,
+                pix, piy, piz, pit,
+                BLOCK_M, BLOCK_N, C_, C_CHUNK, F_,
+                USE_ATTN_BIAS, USE_ACT_BIAS, CDTYPE,
+                TIME_SCALE_C, INPUT_SCALE, CLIP,
             )
             p, dpr = _recompute_p_dpr(
-                qt0,
-                qt1,
-                qt2,
-                u0,
-                u1,
-                u2,
-                do0,
-                do1,
-                do2,
-                k0,
-                k1,
-                k2,
-                v0,
-                v1,
-                v2,
-                e0,
-                e1,
-                e2,
-                wt0,
-                wt1,
-                wt2,
-                dob,
-                lse,
-                col_valid,
-                C_,
-                C_CHUNK,
-                USE_ATTN_BIAS,
-                USE_ACT_BIAS,
-                INPUT_PRECISION,
+                qt0, qt1, qt2, u0, u1, u2, do0, do1, do2,
+                k0, k1, k2, v0, v1, v2, e0, e1, e2, wt0, wt1, wt2,
+                dob, lse, col_valid,
+                C_, C_CHUNK, USE_ATTN_BIAS, USE_ACT_BIAS, INPUT_PRECISION,
             )
             dsum += tl.sum(p * dpr, axis=2)
             psum += tl.sum(p, axis=2)
     d_row = tl.where(psum > 0.0, dsum / psum, 0.0)
     tl.store(d_ptr + row_vec, d_row, mask=row_vec_mask)
 
-    dqp0 = tl.zeros((BLOCK_M, G_PAD, C_CHUNK), dtype=tl.float32)
-    if C_ > C_CHUNK:
-        dqp1 = tl.zeros((BLOCK_M, G_PAD, C_CHUNK), dtype=tl.float32)
-    if C_ > 2 * C_CHUNK:
-        dqp2 = tl.zeros((BLOCK_M, G_PAD, C_CHUNK), dtype=tl.float32)
+    dqp0, dqp1, dqp2 = _zeros3(BLOCK_M, G_PAD, C_CHUNK)
     if USE_ATTN_BIAS:
-        h0 = tl.zeros((BLOCK_M, C_CHUNK, G_PAD), dtype=tl.float32)
-        if C_ > C_CHUNK:
-            h1 = tl.zeros((BLOCK_M, C_CHUNK, G_PAD), dtype=tl.float32)
-        if C_ > 2 * C_CHUNK:
-            h2 = tl.zeros((BLOCK_M, C_CHUNK, G_PAD), dtype=tl.float32)
+        # Held transposed ([M, CC, G]) to match channel-major E; the
+        # epilogue store flips them back once.
+        h0, h1, h2 = _zeros3(BLOCK_M, C_CHUNK, G_PAD)
         sig = tl.zeros((BLOCK_M, G_PAD), dtype=tl.float32)
     if USE_ACT_BIAS:
-        g0 = tl.zeros((BLOCK_M, C_CHUNK, G_PAD), dtype=tl.float32)
-        if C_ > C_CHUNK:
-            g1 = tl.zeros((BLOCK_M, C_CHUNK, G_PAD), dtype=tl.float32)
-        if C_ > 2 * C_CHUNK:
-            g2 = tl.zeros((BLOCK_M, C_CHUNK, G_PAD), dtype=tl.float32)
+        g0, g1, g2 = _zeros3(BLOCK_M, C_CHUNK, G_PAD)
 
     for n0 in range(0, L, BLOCK_N):
         offs_n = n0 + tl.arange(0, BLOCK_N)
         col_valid = offs_n < seqlen
         if n0 < seqlen:
-            if PACKED:
-                col_off = (
-                    (tok0 + offs_n[:, None, None]) * H + offs_g[None, :, None]
-                ) * C_ + offs_cc[None, None, :]
-                feats_j = feats_ptr + (tok0 + offs_n) * FEAT_STRIDE
-            else:
-                col_off = (
-                    (b * H + offs_g[None, :, None]) * L + offs_n[:, None, None]
-                ) * C_ + offs_cc[None, None, :]
-                feats_j = (
-                    feats_ptr + b * L * FEAT_STRIDE + offs_n * FEAT_STRIDE
-                )
+            col_off = _chunk_off(
+                b, tok0, offs_n, offs_g, offs_cc, H, L, C_, PACKED
+            )
+            feats_j = _feat_ptrs(
+                feats_ptr, b, tok0, offs_n, FEAT_STRIDE, L, PACKED
+            )
             col_mask = col_valid[:, None, None] & head_live[None, :, None]
             k0, k1, k2, v0, v1, v2, e0, e1, e2 = _col_tiles(
-                k_ptr,
-                v_ptr,
-                freq_ptr,
-                col_off,
-                col_mask,
-                feats_j,
-                col_valid,
-                pix,
-                piy,
-                piz,
-                pit,
-                BLOCK_M,
-                BLOCK_N,
-                C_,
-                C_CHUNK,
-                F_,
-                USE_ATTN_BIAS,
-                USE_ACT_BIAS,
-                CDTYPE,
-                TIME_SCALE_C,
-                INPUT_SCALE,
-                CLIP,
+                k_ptr, v_ptr, freq_ptr, col_off, col_mask, feats_j, col_valid,
+                pix, piy, piz, pit,
+                BLOCK_M, BLOCK_N, C_, C_CHUNK, F_,
+                USE_ATTN_BIAS, USE_ACT_BIAS, CDTYPE,
+                TIME_SCALE_C, INPUT_SCALE, CLIP,
             )
             p, dpr = _recompute_p_dpr(
-                qt0,
-                qt1,
-                qt2,
-                u0,
-                u1,
-                u2,
-                do0,
-                do1,
-                do2,
-                k0,
-                k1,
-                k2,
-                v0,
-                v1,
-                v2,
-                e0,
-                e1,
-                e2,
-                wt0,
-                wt1,
-                wt2,
-                dob,
-                lse,
-                col_valid,
-                C_,
-                C_CHUNK,
-                USE_ATTN_BIAS,
-                USE_ACT_BIAS,
-                INPUT_PRECISION,
+                qt0, qt1, qt2, u0, u1, u2, do0, do1, do2,
+                k0, k1, k2, v0, v1, v2, e0, e1, e2, wt0, wt1, wt2,
+                dob, lse, col_valid,
+                C_, C_CHUNK, USE_ATTN_BIAS, USE_ACT_BIAS, INPUT_PRECISION,
             )
             ds = p * (dpr - d_row[:, :, None])
             ds = tl.where(col_valid[None, None, :], ds, 0.0)
@@ -994,95 +446,43 @@ def flash_spacetime_bwd_rows_kernel(  # noqa: C901
             dsT = tl.trans(dscd, 1, 0, 2)  # [G, M, N]
 
             # dqp += dS @ k (per chunk).
-            dqp0 += tl.trans(
-                tl.dot(
-                    dsT, tl.trans(k0, 1, 0, 2), input_precision=INPUT_PRECISION
-                ),
-                1,
-                0,
-                2,
+            dqp0, dqp1, dqp2 = _acc3_dotT(
+                dqp0, dqp1, dqp2, dsT, k0, k1, k2,
+                C_, C_CHUNK, INPUT_PRECISION,
             )
-            if C_ > C_CHUNK:
-                dqp1 += tl.trans(
-                    tl.dot(
-                        dsT,
-                        tl.trans(k1, 1, 0, 2),
-                        input_precision=INPUT_PRECISION,
-                    ),
-                    1,
-                    0,
-                    2,
-                )
-            if C_ > 2 * C_CHUNK:
-                dqp2 += tl.trans(
-                    tl.dot(
-                        dsT,
-                        tl.trans(k2, 1, 0, 2),
-                        input_precision=INPUT_PRECISION,
-                    ),
-                    1,
-                    0,
-                    2,
-                )
             if USE_ATTN_BIAS:
                 # H += dS·E (batched over rows), sigma += rowsum(dS).
                 dst_c = tl.trans(dscd, 0, 2, 1)  # [M, N, G]
-                h0 += tl.dot(e0, dst_c, input_precision=INPUT_PRECISION)
-                if C_ > C_CHUNK:
-                    h1 += tl.dot(e1, dst_c, input_precision=INPUT_PRECISION)
-                if C_ > 2 * C_CHUNK:
-                    h2 += tl.dot(e2, dst_c, input_precision=INPUT_PRECISION)
+                h0, h1, h2 = _acc3_e(
+                    h0, h1, h2, e0, e1, e2, dst_c,
+                    C_, C_CHUNK, INPUT_PRECISION,
+                )
                 sig += tl.sum(ds, axis=2)
             if USE_ACT_BIAS:
                 pct_c = tl.trans(pcd, 0, 2, 1)
-                g0 += tl.dot(e0, pct_c, input_precision=INPUT_PRECISION)
-                if C_ > C_CHUNK:
-                    g1 += tl.dot(e1, pct_c, input_precision=INPUT_PRECISION)
-                if C_ > 2 * C_CHUNK:
-                    g2 += tl.dot(e2, pct_c, input_precision=INPUT_PRECISION)
+                g0, g1, g2 = _acc3_e(
+                    g0, g1, g2, e0, e1, e2, pct_c,
+                    C_, C_CHUNK, INPUT_PRECISION,
+                )
 
-    tl.store(dqp_ptr + row_off + 0 * C_CHUNK, dqp0, mask=row_mask)
-    if C_ > C_CHUNK:
-        tl.store(dqp_ptr + row_off + 1 * C_CHUNK, dqp1, mask=row_mask)
-    if C_ > 2 * C_CHUNK:
-        tl.store(dqp_ptr + row_off + 2 * C_CHUNK, dqp2, mask=row_mask)
+    _store3(dqp_ptr, row_off, dqp0, dqp1, dqp2, row_mask, C_, C_CHUNK)
     if USE_ATTN_BIAS:
-        tl.store(
-            hacc_ptr + row_off + 0 * C_CHUNK,
+        _store3(
+            hacc_ptr, row_off,
             tl.trans(h0, 0, 2, 1),
-            mask=row_mask,
+            tl.trans(h1, 0, 2, 1),
+            tl.trans(h2, 0, 2, 1),
+            row_mask, C_, C_CHUNK,
         )
-        if C_ > C_CHUNK:
-            tl.store(
-                hacc_ptr + row_off + 1 * C_CHUNK,
-                tl.trans(h1, 0, 2, 1),
-                mask=row_mask,
-            )
-        if C_ > 2 * C_CHUNK:
-            tl.store(
-                hacc_ptr + row_off + 2 * C_CHUNK,
-                tl.trans(h2, 0, 2, 1),
-                mask=row_mask,
-            )
         tl.store(sig_ptr + row_vec, sig, mask=row_vec_mask)
     if USE_ACT_BIAS:
-        tl.store(
-            gacc_ptr + row_off + 0 * C_CHUNK,
+        _store3(
+            gacc_ptr, row_off,
             tl.trans(g0, 0, 2, 1),
-            mask=row_mask,
+            tl.trans(g1, 0, 2, 1),
+            tl.trans(g2, 0, 2, 1),
+            row_mask, C_, C_CHUNK,
         )
-        if C_ > C_CHUNK:
-            tl.store(
-                gacc_ptr + row_off + 1 * C_CHUNK,
-                tl.trans(g1, 0, 2, 1),
-                mask=row_mask,
-            )
-        if C_ > 2 * C_CHUNK:
-            tl.store(
-                gacc_ptr + row_off + 2 * C_CHUNK,
-                tl.trans(g2, 0, 2, 1),
-                mask=row_mask,
-            )
 
 
 def flash_spacetime_backward(
@@ -1171,7 +571,7 @@ def flash_spacetime_backward(
         FEAT_STRIDE=4,
         BLOCK_M=block_m,
         BLOCK_N=block_n,
-        G_PAD=max(16, 1 << (heads - 1).bit_length()),
+        G_PAD=_next_pow2(heads),
         C_=dim,
         C_CHUNK=16,
         F_=dim // 2,
@@ -1187,41 +587,13 @@ def flash_spacetime_backward(
         num_stages=num_stages,
     )
     flash_spacetime_bwd_rows_kernel[(triton.cdiv(length, block_m), batch)](
-        qc,
-        kc,
-        vc,
-        u,
-        do,
-        wt,
-        featsc,
-        seq32,
-        lse,
-        dsum,
-        dob,
-        dqp,
-        hacc,
-        gacc,
-        sig,
-        cu32,
-        freqs,
+        qc, kc, vc, u, do, wt, featsc, seq32, lse,
+        dsum, dob, dqp, hacc, gacc, sig, cu32, freqs,
         **common,
     )
     flash_spacetime_bwd_cols_kernel[(triton.cdiv(length, block_n), batch)](
-        qc,
-        kc,
-        vc,
-        u,
-        do,
-        wt,
-        featsc,
-        seq32,
-        lse,
-        dsum,
-        dob,
-        dk,
-        dv,
-        cu32,
-        freqs,
+        qc, kc, vc, u, do, wt, featsc, seq32, lse,
+        dsum, dob, dk, dv, cu32, freqs,
         **common,
     )
 
